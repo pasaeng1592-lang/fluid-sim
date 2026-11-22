@@ -11,7 +11,7 @@ HEAD = '''<!doctype html>
 <html lang="ko">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="description" content="설비보전기사 과정평가형 공개문제 공기압 · 유압 12문제 배선 · 배관 연습 시뮬레이터">
 <style>body{margin:0}[hidden]{display:none!important}img{max-width:100%}</style>
 '''

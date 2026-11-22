@@ -183,33 +183,54 @@ function makePanel(P, def, opt) {
   const oilBoard = P.kind === 'hyd';
   const airMods = [];
   const amod = (id, kind, title, w, h, ax, ay) => { const m = mod(id, kind, title, w, h, 'field'); m.air = true; m.ax = ax; m.ay = ay; m.ports = []; airMods.push(m); return m; };
+  /* 부품 설치: 서비스 유닛 · 파워 유닛 · 실린더 · 모터는 보드에 고정, 나머지는 직접 설치.
+     opt.place 가 없으면 모범 자리(홈)에 모두 설치된 보드, 있으면 { pid: [x, y] } 로 놓은 부품만 보드에 올림 */
+  const PLACE = (opt && opt.place) || null;
+  panel.tray = [];
+  panel.smap = PLACE ? {} : null;
+  const imod = (pid, id, kind, title, w, h, ax, ay) => {
+    const pos = PLACE ? PLACE[pid] : [ax, ay];
+    if (!pos) { panel.tray.push({ pid, id, kind, title }); return null; }
+    const m = amod(id, kind, title, w, h, pos[0], pos[1]);
+    m.inst = true; m.pid = pid; m.home = [ax, ay];
+    return m;
+  };
   const port = (m, key, x, y, face, label, role, open, lp) => {
     const id = m.id + '.' + key, B = panel.air;
     const p = { id, m: m.id, key, lx: x, ly: y, x: 0, y: 0, face, label, role, open: !!open, lp: lp || null };
     m.ports.push(p); B.ports[id] = p; B.portIds.push(id); return id;
   };
-  // 리밋스위치 · 근접센서 유닛 (보드에서 도그가 지나는 자리 아래)
+  // 리밋스위치 · 근접센서 유닛 (보드에서 도그가 지나는 자리 아래). 놓인 자리(슬롯)가 곧 감지 위치
+  const slotAt = (x, y) => panel.air.lsSlots.find(sl => Math.abs(sl.ax - x) < 0.5 && Math.abs(sl.ay - y) < 0.5) || null;
+  const lsWhere = m => {
+    const sl = slotAt(m.ax, m.ay);
+    if (PLACE) { if (sl) panel.smap[m.id] = { act: sl.act, end: sl.end }; return sl ? `${sl.act} ${sl.end ? '전진 끝' : '후진 끝'}` : '도그 안 닿음'; }
+    return sensWhere[m.id] || '';
+  };
   const lsUnit = (n, ax, ay) => {
     if (/^LS/.test(n)) {
-      const m = amod(n, 'ls', n, 88, 70, ax, ay);
+      const m = imod(n, n, 'ls', n, 88, 70, ax, ay); if (!m) return;
+      m.plabel = n + ' 리밋스위치';
       const nc = jack(m, 'NC', 18, 56, 'k', 's', 'NC', 'n'), com = jack(m, 'COM', 44, 56, 'b', 's', 'COM', 'n'), no = jack(m, 'NO', 70, 56, 'k', 's', 'NO', 'n');
-      m.sub = sensWhere[n] || '';
+      m.sub = lsWhere(m);
       const d = panel.dev[n] = { kind: 'ls', name: n, label: n, mod: n, poles: [{ com, nc, no, k: 1 }], mapped: true };
       panel.names[n] = d;
       elem('lsno', n, com, no, { dev: n, desc: n + ' COM-NO' });
       elem('lsnc', n, com, nc, { dev: n, desc: n + ' COM-NC' });
     } else {
-      const m = amod(n, 'sen', n, 88, 70, ax, ay);
+      const m = imod(n, n, 'sen', n, 88, 70, ax, ay); if (!m) return;
+      m.plabel = n + ' 근접 센서';
       const p = jack(m, '24V', 18, 56, 'r', 'p', '24V', 'n'), o = jack(m, 'OUT', 44, 56, 'k', 's', 'OUT', 'n'), z = jack(m, '0V', 70, 56, 'b', 'n', '0V', 'n');
-      m.sub = sensWhere[n] || '';
+      m.sub = lsWhere(m);
       panel.dev[n] = { kind: 'sen', name: n, label: n + ' 근접센서', mod: n, p, out: o, n: z, mapped: true };
       panel.names[n] = panel.dev[n];
       elem('sen', n, p, z, { jo: o, dev: n, desc: n + ' 센서' });
     }
   };
   if (airBoard) {
-    const air = panel.air = { medium: 'air', ports: {}, portIds: [], pass: [], src: 'FRL.OUT', din: 'DST.IN', valves: [], cyls: [], scs: [], distOut: [], fc: {}, cols: [], comps: [], sups: [], motors: [], mcs: [], board: null };
+    const air = panel.air = { medium: 'air', ports: {}, portIds: [], pass: [], src: 'FRL.OUT', din: 'DST.IN', valves: [], cyls: [], scs: [], distOut: [], fc: {}, cols: [], comps: [], sups: [], motors: [], mcs: [], board: null, lsSlots: [] };
     const CW = AIR.CW, X0 = AIR.X0;
+    let scN = 0;
     P.acts.forEach((a, i) => {
       const cx = X0 + i * CW;
       air.cols.push({ act: a.id, x: cx });
@@ -219,20 +240,26 @@ function makePanel(P, def, opt) {
       const CAP = port(cy, 'CAP', 16, 40, 's', '헤드', 'CAP', true), ROD = port(cy, 'ROD', 128, 40, 's', '로드', 'ROD', true);
       air.cyls.push({ act: a.id, mod: cy.id, CAP, ROD });
       // 리밋스위치 · 근접센서 — 도그가 지나는 자리 아래 (후진 끝 / 전진 끝)
+      for (const k of [0, 1]) air.lsSlots.push({ act: a.id, end: k, ax: cx + 14 + AIR.DOG0 + (k ? AIR.STROKE : 0) - 44, ay: AIR.LS });
       a.sens.forEach((n, k) => lsUnit(n, cx + 14 + AIR.DOG0 + (k ? AIR.STROKE : 0) - 44, AIR.LS));
       // 속도 제어 밸브 (도면에 있는 쪽 관 자리에 세워 둠)
       if (a.fc) {
-        const n = air.scs.length + 1, sx = cx + 14 + (a.fc === 'cap' ? 16 : 128) - 15;
-        const sc = amod('SC' + n, 'sc', '속도 제어 밸브', 30, 56, sx, AIR.SC);
-        const p2 = port(sc, '2', 15, -3, 'n', '', 'SC', true), p1 = port(sc, '1', 15, 59, 's', '', 'SC', true);
-        air.pass.push([p1, p2]);
-        air.scs.push({ mod: sc.id, act: a.id, side: a.fc, p1, p2, n });
         air.fc[a.id] = a.fc;
+        const n = ++scN, sx = cx + 14 + (a.fc === 'cap' ? 16 : 128) - 15;
+        const sc = imod('SC' + n, 'SC' + n, 'sc', '속도 제어 밸브', 30, 56, sx, AIR.SC);
+        if (sc) {
+          sc.plabel = '속도 제어 밸브 ' + CIRC[n - 1];
+          const p2 = port(sc, '2', 15, -3, 'n', '', 'SC', true), p1 = port(sc, '1', 15, 59, 's', '', 'SC', true);
+          air.pass.push([p1, p2]);
+          air.scs.push({ mod: sc.id, act: a.id, side: a.fc, p1, p2, n });
+        }
       }
       // 5/2 솔레노이드 밸브 — 실린더 아래
       const v = a.valve, dbl = v.kind === '52d';
       const coils = dbl ? [v.l, v.r] : [v.sol];
-      const vm = amod('V' + a.id, 'valve', (dbl ? '5/2 복동' : '5/2 단동') + ' 솔레노이드 밸브', dbl ? 204 : 168, 112, cx + 8, AIR.V);
+      const vm = imod('V' + a.id + '@' + v.kind, 'V' + a.id, 'valve', (dbl ? '5/2 복동' : '5/2 단동') + ' 솔레노이드 밸브', dbl ? 204 : 168, 112, cx + 8, AIR.V);
+      if (!vm) return;
+      vm.plabel = coils.join('·') + ' ' + vm.title;
       vm.sub = dbl ? '5/2-WAY SOLENOID VALVE (DOUBLE)' : '5/2-WAY SOLENOID VALVE (SINGLE)';
       vm.parts.coils = []; vm.dbl = dbl; vm.act = a.id;
       coils.forEach((y, k) => {
@@ -249,21 +276,26 @@ function makePanel(P, def, opt) {
     // 서비스 유닛(FRL) · 분배기 — 맨 아래
     const frl = amod('FRL', 'frl', '서비스 유닛', 116, 150, X0, AIR.BS);
     port(frl, 'OUT', 118, 74, 'e', 'OUT', 'src', false);
-    const dst = amod('DST', 'dist', '분배기', 156, 80, X0 + CW + 20, AIR.BS + 34);
-    const din = port(dst, 'IN', -3, 40, 'w', 'IN', 'din', false);
-    const outs = [];
-    [[42, 24], [70, 24], [98, 24], [42, 54], [70, 54], [98, 54]].forEach(([x, y], k) => outs.push(port(dst, String(k + 1), x, y, 'n', String(k + 1), 'dout', false)));
-    air.distOut = outs; air.pass.push([din, ...outs]);
+    const dst = imod('DST', 'DST', 'dist', '분배기', 156, 80, X0 + CW + 20, AIR.BS + 34);
+    if (dst) {
+      dst.plabel = '분배기 (1×6)';
+      const din = port(dst, 'IN', -3, 40, 'w', 'IN', 'din', false);
+      const outs = [];
+      [[42, 24], [70, 24], [98, 24], [42, 54], [70, 54], [98, 54]].forEach(([x, y], k) => outs.push(port(dst, String(k + 1), x, y, 'n', String(k + 1), 'dout', false)));
+      air.distOut = outs; air.pass.push([din, ...outs]);
+    }
     air.board = { x: 0, y: 0, w: X0 + P.acts.length * CW + 10, h: AIR.BS + 160 };
   }
 
   /* 유압 문제: 실습장 유압 보드 — 파워 유닛 P·T 공급 라인 → P 분배기 · T 분배기 → 밸브 P·T, 밸브 A·B → 실린더 · 모터 (퀵 커플러 호스)
      응용 단계에서는 도면의 응용 기기(카운터밸런스 · 미터아웃 · 파일럿 체크 · 블리드오프 · 감압 · 서지압 · 펌프 체크 · 미터인)를 보드에 붙임 */
   if (oilBoard) {
-    const B = panel.air = { medium: 'oil', ports: {}, portIds: [], pass: [], src: 'PU.P', sink: 'PU.T', din: 'DA.IN', tin: 'DB.IN', valves: [], sups: [], cyls: [], motors: [], comps: [], scs: [], distOut: [], tOut: [], mcs: [], fc: {}, cols: [], board: null, spec: {} };
+    const B = panel.air = { medium: 'oil', ports: {}, portIds: [], pass: [], src: 'PU.P', sink: 'PU.T', din: 'DA.IN', tin: 'DB.IN', valves: [], sups: [], cyls: [], motors: [], comps: [], scs: [], distOut: [], tOut: [], mcs: [], fc: {}, cols: [], board: null, spec: {}, lsSlots: [] };
     const fx = (P.isApp && P.app && P.app.fluid) || [];
     const comp = (kind, id, act, title, w, h, ax, ay, ports, extra) => {
-      const m = amod(id, kind, title, w, h, ax, ay); m.act = act; Object.assign(m, extra || {});
+      const m = imod(id, id, kind, title, w, h, ax, ay); if (!m) return null;
+      m.act = act; Object.assign(m, extra || {});
+      m.plabel = title + (extra && extra.label ? ` (${extra.label.replace(/^감압 /, '')})` : '');
       const ps = {}; for (const [key, x, y, face, label, lp] of ports) ps[key] = port(m, key, x, y, face, label, 'C', false, lp);
       const c = Object.assign({ kind, mod: m.id, act, ports: ps, title }, extra || {}); B.comps.push(c); return c;
     };
@@ -278,6 +310,7 @@ function makePanel(P, def, opt) {
         cy.act = a.id; cy.stroke = AIR.STROKE; cy.oil = true;
         const CAP = port(cy, 'CAP', 16, 40, 's', '헤드', 'CAP', false), ROD = port(cy, 'ROD', 128, 40, 's', '로드', 'ROD', false);
         B.cyls.push({ act: a.id, mod: cy.id, CAP, ROD });
+        for (const k of [0, 1]) B.lsSlots.push({ act: a.id, end: k, ax: cx + 14 + AIR.DOG0 + (k ? AIR.STROKE : 0) - 44, ay: OIL.LS });
         a.sens.forEach((n, k) => lsUnit(n, cx + 14 + AIR.DOG0 + (k ? AIR.STROKE : 0) - 44, OIL.LS));
         line = { cap: cx + 30, rod: cx + 142 };
       } else {
@@ -307,10 +340,13 @@ function makePanel(P, def, opt) {
         // 헤드(입구) 쪽 라인 바로 아래 · 밸브 A 바로 위에 두어 호스가 짧게 (헤드 쪽 중간 기기가 있으면 오른쪽으로)
         const capInl = fx.some(f => f.act === a.id && f.side === 'cap' && (f.kind === 'cb' || f.kind === 'mout'));
         const mw = capInl ? 150 : 120, mx = capInl ? cx + 180 : cx + 8, d = capInl ? [25, 75, 125] : [20, 60, 100];
-        const mc = amod('MC' + a.id, 'hmc', '멀티 커넥터', mw, 44, mx, OIL.BR); mc.act = a.id;
-        const mp = [];
-        [[d[0], -3, 'n'], [d[1], -3, 'n'], [d[2], -3, 'n'], [d[0], 47, 's'], [d[1], 47, 's'], [d[2], 47, 's']].forEach(([x, y, f], k) => mp.push(port(mc, 'A' + (k + 1), x, y, f, 'A' + (k + 1), 'mc', false, 'e')));
-        B.pass.push(mp); B.mcs.push({ mod: mc.id, act: a.id, ports: mp });
+        const mc = imod('MC' + a.id, 'MC' + a.id, 'hmc', '멀티 커넥터', mw, 44, mx, OIL.BR);
+        if (mc) {
+          mc.act = a.id; mc.plabel = '멀티 커넥터 (6구멍)';
+          const mp = [];
+          [[d[0], -3, 'n'], [d[1], -3, 'n'], [d[2], -3, 'n'], [d[0], 47, 's'], [d[1], 47, 's'], [d[2], 47, 's']].forEach(([x, y, f], k) => mp.push(port(mc, 'A' + (k + 1), x, y, f, 'A' + (k + 1), 'mc', false, 'e')));
+          B.pass.push(mp); B.mcs.push({ mod: mc.id, act: a.id, ports: mp });
+        }
         let bx = capInl ? cx + 342 : cx + 170;
         for (const f of br) {
           if (f.kind === 'bleed') { comp('hbl', 'BL' + a.id, a.id, '블리드오프 유량제어밸브', 76, 44, bx, OIL.BR, [['IN', -3, 22, 'w', 'IN', 'n'], ['OUT', 79, 22, 'e', 'T', 'n']]); bx += 88; }
@@ -323,7 +359,9 @@ function makePanel(P, def, opt) {
       // 방향 제어 밸브 (서브 플레이트: 위 A · B, 아래 P · T)
       const v = a.valve, kind = v.kind, two = kind === '22';
       const coils = kind === '43' || kind === '42d' ? [v.l, v.r] : [v.sol];
-      const vm = amod('V' + a.id, 'valve', OIL_VNAME(kind, v), coils.length > 1 ? 204 : 168, 120, cx + 8, OIL.V);
+      const vm = imod('V' + a.id + '@' + kind + (kind === '43' ? v.boxes[1] : ''), 'V' + a.id, 'valve', OIL_VNAME(kind, v), coils.length > 1 ? 204 : 168, 120, cx + 8, OIL.V);
+      if (vm) {
+      vm.plabel = coils.join('·') + ' ' + vm.title;
       vm.oil = true; vm.vkind = kind; vm.dbl = coils.length > 1; vm.act = a.id; vm.boxes = v.boxes.slice();
       vm.sub = { '43': '4/3-WAY DOUBLE SOLENOID VALVE', '42s': '4/2-WAY SINGLE SOLENOID VALVE', '42d': '4/2-WAY DOUBLE SOLENOID VALVE', '22': '2/2-WAY SOLENOID VALVE' }[kind] || '';
       vm.parts.coils = [];
@@ -339,9 +377,11 @@ function makePanel(P, def, opt) {
       if (two) { pA = port(vm, 'A', 102, 22, 'n', 'A', 'A', false, 'e'); pP = port(vm, 'P', 102, 114, 's', 'P', 'P', false, 'e'); }
       else { pA = port(vm, 'A', 80, 22, 'n', 'A', 'A', false); pB = port(vm, 'B', 124, 22, 'n', 'B', 'B', false); pP = port(vm, 'P', 80, 114, 's', 'P', 'P', false, 'w'); pT = port(vm, 'T', 124, 114, 's', 'T', 'T', false, 'e'); }
       B.valves.push({ act: a.id, mod: vm.id, P: pP, A: pA, B: pB, T: pT, coils, kind, two, dbl: coils.length > 1 });
+      }
       // P 라인 기기: 공급 2/2 솔레노이드 (기본) · 감압밸브 · 미터인 유량제어 (응용)
-      if (a.supply) {
-        const sm = amod('S' + a.id, 'valve', '2/2 솔레노이드 밸브 (공급)', 168, 100, cx + 168, OIL.PL);
+      const sm = a.supply ? imod('S' + a.id + '@22sup', 'S' + a.id, 'valve', '2/2 솔레노이드 밸브 (공급)', 168, 100, cx + 168, OIL.PL) : null;
+      if (sm) {
+        sm.plabel = a.supply.sol + ' 2/2 솔레노이드 밸브 (공급)';
         sm.oil = true; sm.vkind = '22'; sm.sup = true; sm.act = a.id; sm.boxes = a.supply.boxes.slice(); sm.parts.coils = [];
         const y = a.supply.sol;
         const jp = jack(sm, y + '+', 22, 58, 'r', 'p', '+', 's'), jn = jack(sm, y + '-', 46, 58, 'b', 'n', '−', 's');
@@ -370,7 +410,8 @@ function makePanel(P, def, opt) {
     port(pu, 'P', 104, 239, 's', 'P', 'src', false, 'w'); port(pu, 'T', 144, 239, 's', 'T', 'sink', false, 'e');
     if (fx.some(f => f.kind === 'pumpchk')) comp('hck', 'CK', null, '체크밸브 (펌프 토출)', 30, 56, RX + 89, OIL.PC, [['1', 15, -3, 'n', '1', 'w'], ['2', 15, 59, 's', '2', 'w']], { pump: true, down: true });
     const dist = (id, title, y) => {
-      const m = amod(id, 'hdist', title, 44, OIL.DH, RX + 4, y);
+      const m = imod(id, id, 'hdist', title, 44, OIL.DH, RX + 4, y); if (!m) return [];
+      m.plabel = title;
       const outs = []; for (let k = 0; k < 6; k++) outs.push(port(m, String(k + 1), -3, 30 + 22 * k, 'w', String(k + 1), 'dout', false, 'e'));
       const inp = port(m, 'IN', 47, 85, 'e', 'IN', 'din', false, 'n');
       B.pass.push([inp, ...outs]);
@@ -1670,8 +1711,83 @@ function analyzeOil(panel, tubes, P) {
   return { items, errors, ok: !errors };
 }
 
+/* ======================================================================
+   부품 설치 — 서비스 유닛 · 파워 유닛 · 실린더 · 모터 말고는 직접 보드에 다는 연습
+   · 자리(place): { pid: [x, y] } 보드 왼쪽 위 기준. pid는 부품 id, 밸브는 종류까지 붙임(V A@52d) → 응용에서 밸브 종류가 바뀌면 바꿔 달아야 함
+   · 리밋스위치 · 근접센서는 실린더 도그가 멈추는 끝 자리(슬롯)에만 달리고, 단 자리가 곧 감지 위치
+   ====================================================================== */
+const GRID = 4;
+const instMods = full => full.field.filter(m => m.air && m.inst);
+/* 모범 자리 (부품을 처음 만든 자리) */
+function homePlace(full) { const o = {}; for (const m of instMods(full)) o[m.pid] = [m.home[0], m.home[1]]; return o; }
+/* 놓을 수 있는지: 보드 안 · 다른 부품과 겹치지 않음 · 커플러끼리 너무 붙지 않음 · 리밋스위치 자리는 비워 둠 */
+function placeCheck(full, place, pid, ax, ay) {
+  const A = full.air, B = A && A.board; if (!B) return { ok: false, x: ax, y: ay, reason: '보드가 없어요.' };
+  const mods = full.field.filter(m => m.air), me = mods.find(m => m.pid === pid);
+  if (!me) return { ok: false, x: ax, y: ay, reason: '이 단계에서는 쓰지 않는 부품이에요.' };
+  const isLS = me.kind === 'ls' || me.kind === 'sen';
+  const others = [];
+  for (const m of mods) {
+    if (m === me) continue;
+    if (m.inst) { const p = place[m.pid]; if (p) others.push({ m, x: p[0], y: p[1] }); }
+    else others.push({ m, x: m.ax, y: m.ay });
+  }
+  let x, y, slot = null;
+  if (isLS) {
+    let bd = Infinity;
+    for (const sl of A.lsSlots) { const d = Math.hypot(sl.ax - ax, sl.ay - ay); if (d < bd) { bd = d; slot = sl; } }
+    if (!slot || bd > 90) return { ok: false, x: ax, y: ay, reason: `${me.kind === 'ls' ? '리밋스위치' : '근접 센서'}는 실린더 도그가 멈추는 끝 자리(점선 칸)에만 달 수 있어요.` };
+    x = slot.ax; y = slot.ay;
+  } else { x = Math.round(ax); y = Math.round(ay); }   // 격자 맞춤은 화면(끌기)에서
+  const R = (m, px, py, pad) => ({ x0: px - pad, y0: py - pad, x1: px + m.w + pad, y1: py + m.h + pad });
+  const hit = (a, b) => a.x0 < b.x1 && b.x0 < a.x1 && a.y0 < b.y1 && b.y0 < a.y1;
+  const inR = (r, px, py) => px > r.x0 && px < r.x1 && py > r.y0 && py < r.y1;
+  const nm = m => m.plabel || m.title;
+  const fail = (reason, on) => ({ ok: false, x, y, reason, on: on || null, slot });
+  // 보드 안 (튀어나온 커플러까지)
+  const ext = R(me, x, y, 0);
+  for (const p of me.ports) { ext.x0 = Math.min(ext.x0, x + p.lx - 10); ext.y0 = Math.min(ext.y0, y + p.ly - 10); ext.x1 = Math.max(ext.x1, x + p.lx + 10); ext.y1 = Math.max(ext.y1, y + p.ly + 10); }
+  const outside = ext.x0 < 2 || ext.y0 < 2 || ext.x1 > B.w - 2 || ext.y1 > B.h - 2;
+  const mine = R(me, x, y, 3);
+  for (const o of others) {
+    const r = R(o.m, o.x, o.y, 0);
+    if (hit(mine, r)) return fail(`${josa(nm(o.m), '과', '와')} 겹쳐요.`, o.m.id);
+    for (const p of me.ports) {
+      if (inR(R(o.m, o.x, o.y, 4), x + p.lx, y + p.ly)) return fail(`${nm(me)}의 ${p.label || p.key} 구멍이 ${nm(o.m)}에 닿아요 — 조금 띄워 주세요.`, o.m.id);
+      for (const q of o.m.ports) if (Math.hypot(x + p.lx - (o.x + q.lx), y + p.ly - (o.y + q.ly)) < 18) return fail(`${nm(o.m)}의 구멍과 너무 붙어요 — 호스(관)를 꽂을 자리가 없어요.`, o.m.id);
+    }
+    for (const q of o.m.ports) if (inR(R(me, x, y, 4), o.x + q.lx, o.y + q.ly)) return fail(`${nm(o.m)}의 구멍을 가려요 — 조금 띄워 주세요.`, o.m.id);
+  }
+  if (!isLS) for (const sl of A.lsSlots) if (hit(R(me, x, y, 2), { x0: sl.ax, y0: sl.ay, x1: sl.ax + 88, y1: sl.ay + 70 })) return fail('리밋스위치 · 센서를 다는 자리(실린더 도그 아래)예요 — 다른 부품은 비켜서 놓아 주세요.');
+  if (outside) return fail('보드 밖으로 나가요 — 보드 안쪽에 놓아 주세요.');
+  return { ok: true, x, y, slot };
+}
+/* 설치 검사: 안 단 부품 · 리밋스위치/센서 자리 (도면의 감지 위치와 비교) */
+function installReport(full, place, P) {
+  const A = full.air; if (!A) return { items: [], missing: 0, wrong: 0, total: 0, placed: 0, ok: true };
+  const mods = instMods(full), items = [];
+  const want = {}; for (const a of P.acts) if (a.type === 'cyl') a.sens.forEach((n, k) => { want[n] = { act: a.id, end: k }; });
+  const endW = e => e ? '전진 끝' : '후진 끝';
+  const missing = mods.filter(m => !place[m.pid]);
+  for (const m of missing) items.push({ sev: 'err', kind: 'missing', pid: m.pid, mods: [], text: `${josa(m.plabel || m.title, '을', '를')} 아직 보드에 달지 않았어요.` });
+  let wrong = 0;
+  for (const m of mods) {
+    if (!(m.kind === 'ls' || m.kind === 'sen')) continue;
+    const p = place[m.pid]; if (!p) continue;
+    const sl = A.lsSlots.find(s => Math.abs(s.ax - p[0]) < 0.5 && Math.abs(s.ay - p[1]) < 0.5), w = want[m.id];
+    if (!sl) { wrong++; items.push({ sev: 'err', kind: 'ls', pid: m.pid, mods: [m.id], text: `${josa(m.id, '이', '가')} 실린더 도그가 닿지 않는 자리에 있어요 — 실린더 끝 자리(점선 칸)로 옮기세요.` }); continue; }
+    if (w && (sl.act !== w.act || sl.end !== w.end)) {
+      wrong++;
+      items.push({ sev: 'err', kind: 'ls', pid: m.pid, mods: [m.id], text: `${josa(m.id, '이', '가')} 실린더 ${sl.act} ${endW(sl.end)}에 달려 있어요. 도면에서 ${josa(m.id, '은', '는')} 실린더 ${w.act} ${endW(w.end)}을 감지해요 → 그 자리로 옮기세요. 지금 자리면 ${josa(m.id, '이', '가')} 엉뚱한 때 켜져서 순서가 틀려요.` });
+    }
+  }
+  const total = mods.length, placed = total - missing.length;
+  if (!missing.length && !wrong) items.push({ sev: 'ok', kind: 'done', mods: [], text: `부품 ${total}개를 모두 달았고, 리밋스위치 · 센서도 도면 자리에 있어요.` });
+  return { items, missing: missing.length, wrong, total, placed, ok: !missing.length && !wrong };
+}
+
 const API = { makePanel, buildWireNet, analyze, autoWire, wireGuide, mapTable, validWires, refFunctions, paths, sopOf, compareSop, jackName, shortTitle, CIRC,
-  portName, valveName, validTubes, airModel, analyzeAir, autoPipe, startWires, AIR };
+  portName, valveName, validTubes, airModel, analyzeAir, autoPipe, startWires, AIR, homePlace, placeCheck, installReport };
 if (typeof module !== 'undefined' && module.exports) module.exports = API;
 root.HSIM = Object.assign(root.HSIM || {}, { WIRE: API });
 })(typeof window !== 'undefined' ? window : globalThis);

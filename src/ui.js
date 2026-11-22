@@ -1481,6 +1481,9 @@ app.wire = { target: 'fix', wires: [], tubes: [], undo: [], sel: null, selP: nul
 const WP = { svg: null };
 /* 기본 → 응용을 한 배선에서 이어 하므로 선 · 관 · 설정값은 단계와 상관없이 문제마다 하나 */
 function wireKey() { return 'wireS.' + app.P.key; }
+function placeKey() { return 'placeS.' + app.P.key; }
+const PNF = () => app.wire.full || app.wire.panel;   // 모범(전체) 보드: 부품 이름 · 모범 배선 · 모범 배관은 여기서
+const sameWires = (a, b) => a.length === b.length && a.every((x, i) => x && b[i] && x.a === b[i].a && x.b === b[i].b);
 function tubeKey() { return 'tubeS.' + app.P.key; }
 function preKey() { return 'preS.' + app.P.key; }
 function stagePass() { return store.get('passS.' + app.P.key, {}); }
@@ -1489,7 +1492,7 @@ function stageDefs() {
   return { fix, app: P.app ? (P.app.ladder ? E.normalizeDef(P.app.ladder) : fix) : null };
 }
 /* 배선 연습 시뮬레이터 정의: 꽂은 선(넷리스트) + 공압 보드면 꽂은 관(공기 흐름) */
-function wireSimDef() { const w = app.wire; return { __net: w.W.net, __air: w.AM }; }
+function wireSimDef() { const w = app.wire; return { __net: w.W.net, __air: w.AM, __smap: w.panel.smap }; }
 function wireDef() {
   const P = app.P;
   if (app.wire.target === 'app' && P.app) return P.app.ladder ? E.normalizeDef(P.app.ladder) : E.applyPatches(P.ladder, P.fix).def;
@@ -1499,27 +1502,100 @@ function wireDef() {
 function setupWire(PV, def) {
   const w = app.wire, P = app.P;
   const D = stageDefs(), other = w.target === 'app' ? D.fix : D.app;
-  w.panel = WIRE.makePanel(PV, def, { union: other ? [other] : [] });
+  w.popt = { PV, def, union: other ? [other] : [] };
+  w.full = WIRE.makePanel(PV, def, { union: w.popt.union });
+  w.presets = w.full.presets;
   const pre = store.get(preKey(), null);
-  if (pre) for (const k in pre) if (k in w.panel.presets) w.panel.presets[k] = pre[k];
-  // 처음 여는 문제는 실습장 시작 상태(전원 · 버스 점퍼)로. 밸브가 바뀌어 없어진 코일 단자의 선은 뺌
-  const raw = store.get(wireKey(), null);
-  w.wires = raw ? WIRE.validWires(w.panel, raw) : WIRE.startWires(w.panel);
-  w.dropped = raw ? raw.length - w.wires.length : 0;
-  w.droppedOn = raw ? [...new Set(raw.filter(x => x && !(w.panel.jacks[x.a] && w.panel.jacks[x.b])).flatMap(x => [x.a, x.b]).filter(id => !w.panel.jacks[id]).map(id => id.split('.').pop().replace(/[+-]$/, '')))] : [];
-  if (!raw || w.dropped) store.set(wireKey(), w.wires);
-  const rawT = store.get(tubeKey(), []) || [];
-  w.tubes = WIRE.validTubes(w.panel, rawT);
-  // ①에는 응용 부품이 보드에 없어서, 거기 꽂은 호스는 따로 두었다가 ②에서 다시 보여줌
-  w.tubesAside = w.panel.air ? rawT.filter(t => t && !(w.panel.air.ports[t.a] && w.panel.air.ports[t.b])) : [];
+  if (pre) for (const k in pre) if (k in w.presets) w.presets[k] = pre[k];
+  const rawW = store.get(wireKey(), null), rawT = store.get(tubeKey(), []) || [];
+  // 부품 자리: 처음 여는 문제는 빈 보드(서비스 유닛 · 파워 유닛 · 실린더 · 모터만). 예전에 꽂던 선 · 관이 있으면 모범 자리에 다 단 것으로
+  let place = store.get(placeKey(), null);
+  if (!place || typeof place !== 'object') {
+    place = {};
+    const fresh = !rawW || (!rawT.length && sameWires(rawW, WIRE.startWires(w.full)));
+    if (!fresh && w.full.air) for (const k of ['fix', 'app']) { const V = stageView(k); if (V) Object.assign(place, WIRE.homePlace(WIRE.makePanel(V.PV, V.def))); }
+    store.set(placeKey(), place);
+  }
+  w.place = place;
+  w.bumped = fixPlace();
+  if (w.bumped) setTimeout(() => wireToast(`자리가 겹친 부품 ${w.bumped}개는 부품함으로 돌려놨어요 — 다시 달아 주세요.`, 5000), 300);
+  // 처음 여는 문제는 실습장 시작 상태(전원 · 버스 점퍼)로. 보드에 없는 부품(안 단 부품 · 바뀐 밸브의 코일)에 꽂힌 선 · 관은 따로 두었다가 다시 달면 그대로
+  w.wiresAll = rawW ? rawW.filter(x => x && x.a && x.b) : WIRE.startWires(w.full);
+  w.tubesAll = rawT.filter(t => t && t.a && t.b);
+  if (!rawW) store.set(wireKey(), w.wiresAll);
+  w.panel = instPanel();
+  splitAside();
   w.pass = false;
   w.undo = []; w.sel = null; w.selP = null; w.selWire = -1; w.selTube = -1; w.hover = null; w.hoverP = null; w.auto = null; w.autoAir = null; w.check = null; w.checkAir = null; w.run = null; w.stale = false; w.flash = null; w.confirmAuto = false; w.confirmTok = (w.confirmTok || 0) + 1;
+  w.selMod = null; w.placing = null; w.inst = null;
   w.airOn = true; w.bvP = true; w.bvT = true;
   w.W = WIRE.buildWireNet(w.panel, w.wires);
   w.AM = w.panel.air ? WIRE.airModel(w.panel, w.tubes, { on: w.airOn, bvP: w.bvP, bvT: w.bvT }) : null;
   indexNodes();
   wireChrome();
   renderPanel();
+}
+/* 단계별 문제 정의 (① 정정 도면 / ② 응용) */
+function stageView(k) {
+  const P = app.P, D = stageDefs();
+  if (k === 'app') return P.app ? { PV: Object.assign({}, P, { acts: P.app.acts || P.acts, isApp: true }), def: D.app } : null;
+  return { PV: P, def: D.fix };
+}
+/* 지금 단계 보드의 설치 부품 (모범 보드 기준) */
+const instMods = () => { const f = app.wire.full; return f && f.air ? f.field.filter(m => m.inst) : []; };
+const fullMod = pid => instMods().find(m => m.pid === pid) || null;
+function curPlace(except) {
+  const w = app.wire, o = {};
+  for (const m of instMods()) if (m.pid !== except && w.place[m.pid]) o[m.pid] = w.place[m.pid];
+  return o;
+}
+/* 저장된 자리 확인: 이 단계 부품끼리 겹치거나 보드 밖이면(드묾) 부품함으로 */
+function fixPlace() {
+  const w = app.wire, ok = {}; let n = 0;
+  for (const m of instMods()) {
+    const p = w.place[m.pid]; if (!p) continue;
+    const r = WIRE.placeCheck(w.full, ok, m.pid, p[0], p[1]);
+    if (r.ok && r.x === p[0] && r.y === p[1]) ok[m.pid] = p; else { delete w.place[m.pid]; n++; }
+  }
+  if (n) store.set(placeKey(), w.place);
+  return n;
+}
+/* 놓은 부품만 올린 보드 */
+function instPanel() {
+  const w = app.wire;
+  if (!w.full.air) return w.full;
+  const pn = WIRE.makePanel(w.popt.PV, w.popt.def, { union: w.popt.union, place: curPlace() });
+  pn.presets = w.presets;
+  return pn;
+}
+/* 보드에 있는 단자 · 구멍에 꽂힌 선 · 관만 보이고, 나머지는 따로(부품을 다시 달면 그대로) */
+function splitAside() {
+  const w = app.wire, pn = w.panel, A = pn.air;
+  const key = x => [x.a, x.b].sort().join('|');
+  w.wires = []; w.wiresAside = [];
+  const sw = new Set();
+  for (const x of w.wiresAll) { if (x.a === x.b || sw.has(key(x))) continue; sw.add(key(x)); (pn.jacks[x.a] && pn.jacks[x.b] ? w.wires : w.wiresAside).push({ a: x.a, b: x.b }); }
+  w.tubes = []; w.tubesAside = [];
+  const st = new Set(), used = new Set();
+  for (const t of w.tubesAll) {
+    if (t.a === t.b || st.has(key(t))) continue; st.add(key(t));
+    const on = A && A.ports[t.a] && A.ports[t.b];
+    if (on && !used.has(t.a) && !used.has(t.b)) { used.add(t.a); used.add(t.b); w.tubes.push({ a: t.a, b: t.b }); }
+    else w.tubesAside.push({ a: t.a, b: t.b });
+  }
+}
+/* 부품 자리가 바뀜: 보드 다시 만들기 */
+function placeChanged(restore) {
+  const w = app.wire;
+  if (!restore) { w.wiresAll = w.wires.concat(w.wiresAside || []); w.tubesAll = w.tubes.concat(w.tubesAside || []); }
+  store.set(placeKey(), w.place);
+  w.panel = instPanel();
+  splitAside();
+  w.selWire = -1; w.selTube = -1; w.sel = null; w.selP = null; w.hover = null; w.hoverP = null;
+  if (w.selMod && !w.panel.mods[w.selMod]) w.selMod = null;
+  renderPanel();
+  wireChanged();
+  updDel(); fillInstall();
 }
 /* 공압 보드가 있으면 도구 이름 · 설명을 배선+배관으로 */
 /* 보드 말: 공압(관 · 포트 · 공기) / 유압(호스 · 커플러 · 기름) */
@@ -1550,11 +1626,14 @@ function indexNodes() {
 }
 function wireChanged(keepResults) {
   const w = app.wire;
-  store.set(wireKey(), w.wires);
-  if (w.panel.air) {
+  w.wiresAll = w.wires.concat(w.wiresAside || []);
+  store.set(wireKey(), w.wiresAll);
+  {
+    // 한 구멍에 관 하나: 따로 둔 관이 지금 꽂은 관과 같은 구멍을 쓰면 버림
     const used = new Set(w.tubes.flatMap(t => [t.a, t.b]));
     w.tubesAside = (w.tubesAside || []).filter(t => !used.has(t.a) && !used.has(t.b));
-    store.set(tubeKey(), w.tubes.concat(w.tubesAside));
+    w.tubesAll = w.tubes.concat(w.tubesAside);
+    store.set(tubeKey(), w.tubesAll);
   }
   w.W = WIRE.buildWireNet(w.panel, w.wires);
   w.AM = w.panel.air ? WIRE.airModel(w.panel, w.tubes, { on: w.airOn, bvP: w.bvP, bvT: w.bvT }) : null;
@@ -1562,7 +1641,7 @@ function wireChanged(keepResults) {
   pbUp(); for (const k in pbx) pbx[k].up();
   for (const k in panelHeld) delete panelHeld[k];
   app.sim = new E.Sim(app.PV, wireSimDef());
-  if (!keepResults && (w.check || w.run || w.checkAir)) { w.stale = true; w.pass = false; drawAllMarks(); }
+  if (!keepResults && (w.check || w.run || w.checkAir || w.inst)) { w.stale = true; w.pass = false; drawAllMarks(); }
   w.auto = w.auto && w.auto.def === app.def ? w.auto : null;
   pbExtraUI(); buildLeds();
   app.logN = 0; clear($('#log')); app.lastProgKey = ''; app.waitStep = false;
@@ -1570,8 +1649,13 @@ function wireChanged(keepResults) {
   renderWires(); renderTubes(); drawOverlay(); renderWireResults(); wireBadge();
   frame(0, true);
 }
-function pushUndo() { const w = app.wire; w.undo.push(JSON.stringify({ w: w.wires, t: w.tubes })); if (w.undo.length > 80) w.undo.shift(); $('#wUndo').disabled = false; }
-function updDel() { const w = app.wire; $('#wDel').disabled = w.selWire < 0 && w.selTube < 0; }
+function pushUndo() { const w = app.wire; w.undo.push(JSON.stringify({ w: w.wires.concat(w.wiresAside || []), t: w.tubes.concat(w.tubesAside || []), p: w.place })); if (w.undo.length > 80) w.undo.shift(); $('#wUndo').disabled = false; }
+function updDel() {
+  const w = app.wire, b = $('#wDel'); if (!b) return;
+  b.disabled = w.selWire < 0 && w.selTube < 0 && !w.selMod;
+  const f = FW();
+  b.textContent = w.selMod ? '부품 빼기' : f.air ? `선·${f.tube} 지우기` : '선 지우기';
+}
 function addWire(a, b) {
   const w = app.wire; if (!a || !b || a === b) return;
   if (w.wires.some(x => (x.a === a && x.b === b) || (x.a === b && x.b === a))) { flashSimple([a, b]); return; }
@@ -1586,21 +1670,195 @@ function addTube(a, b) {
   pushUndo(); w.tubes.push({ a, b }); w.selWire = -1; w.selTube = -1; updDel(); wireChanged();
 }
 function selectWire(i) {
-  const w = app.wire; w.selWire = i; w.selTube = -1; w.sel = null; w.selP = null;
+  const w = app.wire; w.selWire = i; w.selTube = -1; w.sel = null; w.selP = null; w.selMod = null;
   updDel();
   renderWires(); renderTubes(); drawOverlay();
 }
 function selectTube(i) {
-  const w = app.wire; w.selTube = i; w.selWire = -1; w.sel = null; w.selP = null;
+  const w = app.wire; w.selTube = i; w.selWire = -1; w.sel = null; w.selP = null; w.selMod = null;
   updDel();
   renderWires(); renderTubes(); drawOverlay();
 }
 function deleteSel() {
   const w = app.wire;
+  if (w.selMod) { const m = w.panel.mods[w.selMod]; w.selMod = null; if (m && m.pid) uninstallPart(m.pid); return; }
   if (w.selWire >= 0) { pushUndo(); w.wires.splice(w.selWire, 1); w.selWire = -1; }
   else if (w.selTube >= 0) { pushUndo(); w.tubes.splice(w.selTube, 1); w.selTube = -1; }
   else return;
   updDel(); wireChanged();
+}
+/* ---------- 부품 설치 (부품함 → 보드) ---------- */
+const PART_ORDER = { valve: 0, ls: 1, sen: 1, sc: 2, hcb: 3, hfc: 3, hpoc: 3, hck: 3, hmc: 4, hbl: 4, hrv: 4, hmu: 4, hprv: 5, hthr: 5, dist: 6, hdist: 6 };
+const PART_BADGE = { valve: '밸브', ls: '리밋', sen: '센서', sc: '속도', dist: '분배', hdist: '분배', hck: '체크', hmu: '체크', hcb: 'CB', hfc: '유량', hpoc: 'POC', hmc: 'MC', hbl: '유량', hrv: '릴리프', hprv: '감압', hthr: '유량' };
+const partName = m => m.plabel || m.title;
+function partCard(m) {
+  const main = m.kind === 'ls' || m.kind === 'sen' ? m.id : m.kind === 'valve' ? m.parts.coils.map(c => c.name).join('·') : m.kind === 'sc' ? m.plabel : m.kind === 'hdist' ? m.title.replace(/ \(.*\)$/, '') : m.title;
+  const sub = m.kind === 'valve' ? m.title.replace(' 솔레노이드 밸브', '') : m.label ? m.label.replace(/^감압 /, '') : '';
+  return { main, sub, badge: PART_BADGE[m.kind] || '부품' };
+}
+function fillInstall() {
+  const box = $('#wInst'); if (!box) return;
+  clear(box);
+  const w = app.wire, f = FW(), ms = instMods().slice().sort((a, b) => (PART_ORDER[a.kind] || 9) - (PART_ORDER[b.kind] || 9) || (a.id < b.id ? -1 : 1));
+  const cur = curPlace(), left = ms.filter(m => !cur[m.pid]);
+  const hd = h('div', 'winh' + (left.length ? '' : ' ok'));
+  hd.appendChild(h('b', null, '부품 설치'));
+  hd.appendChild(h('span', null, left.length ? `${ms.length - left.length} / ${ms.length}개 설치` : `${ms.length}개 모두 설치 ✓`));
+  box.appendChild(hd);
+  box.appendChild(h('p', 'note sm', (f.oil ? '파워 유닛과 실린더 · 모터는 보드에 붙어 있어요. ' : '서비스 유닛과 실린더는 보드에 붙어 있어요. ')
+    + '나머지는 부품함에서 보드로 끌어다 놓거나, 눌러서 고른 뒤 보드에서 달 자리를 누르세요. 리밋스위치 · 센서는 실린더 도그가 멈추는 끝 자리(점선 칸)에만 달려요 — 회로도에서 어느 실린더 어느 끝인지 보고 다세요.'));
+  if (left.length) {
+    const tray = h('div', 'wtray');
+    for (const m of left) {
+      const c = partCard(m), b = h('button', 'wpart k-' + m.kind + (w.placing && w.placing.pid === m.pid ? ' on' : ''));
+      b.dataset.pid = m.pid; b.type = 'button';
+      b.appendChild(h('span', 'wpi', c.badge));
+      const tx = h('span', 'wpt'); tx.appendChild(h('b', null, c.main)); if (c.sub) tx.appendChild(h('small', null, c.sub)); b.appendChild(tx);
+      b.title = partName(m) + ' — 보드로 끌어다 놓거나, 누른 뒤 보드의 달 자리를 누르세요';
+      b.addEventListener('pointerdown', ev => trayDown(ev, m.pid));
+      b.addEventListener('click', ev => ev.preventDefault());
+      tray.appendChild(b);
+    }
+    box.appendChild(tray);
+  } else box.appendChild(h('p', 'note sm okline', '부품을 모두 달았어요. 옮기려면 보드에서 부품 몸체를 끌고, 빼려면 부품을 눌러 고른 뒤 "부품 빼기"(Delete)를 누르거나 여기 오른쪽 칸으로 끌어 놓으세요.'));
+  const row = h('div', 'wrow');
+  if (left.length) { const b1 = h('button', 'btn sm'); twoStep(b1, '남은 부품 모범 자리에 달기', '한 번 더 누르면 안 단 부품을 모범 자리에 달아요', installRest); row.appendChild(b1); }
+  if (left.length < ms.length) { const b2 = h('button', 'btn sm'); twoStep(b2, '부품 모두 빼기', '한 번 더 누르면 단 부품을 모두 빼요', uninstallAll); row.appendChild(b2); }
+  box.appendChild(row);
+}
+/* 부품함 카드: 끌어서 놓기 / 눌러 고른 뒤 보드 누르기 */
+function trayDown(ev, pid) {
+  const w = app.wire;
+  if (ev.button > 0) return;
+  ev.preventDefault();
+  if (w.placing && w.placing.pid === pid && w.placing.armed) { endPlacing(); wireToast('부품 달기를 취소했어요.'); return; }
+  const m = fullMod(pid); if (!m) return;
+  w.placing = { pid, from: 'tray', grab: [m.w / 2, m.h / 2], armed: false, cand: null };
+  w.selMod = null; updDel(); markTray();
+  const st = { x: ev.clientX, y: ev.clientY, id: ev.pointerId, moved: false };
+  const mv = e => {
+    if (e.pointerId !== st.id || !w.placing) return;
+    if (!st.moved && Math.hypot(e.clientX - st.x, e.clientY - st.y) > 6) st.moved = true;
+    if (st.moved) { dragChip(e, partName(m)); placingMove(e); }
+  };
+  const up = e => {
+    if (e.pointerId !== st.id) return;
+    window.removeEventListener('pointermove', mv); window.removeEventListener('pointerup', up); window.removeEventListener('pointercancel', up);
+    dragChip(null);
+    if (!w.placing) return;
+    if (e.type === 'pointercancel') { if (!st.moved) { w.placing.armed = true; armToast(m); } else endPlacing(); return; }
+    if (!st.moved) { w.placing.armed = true; drawPlacing(); armToast(m); return; }
+    placingDrop(e);
+  };
+  window.addEventListener('pointermove', mv); window.addEventListener('pointerup', up); window.addEventListener('pointercancel', up);
+}
+function armToast(m) {
+  wireToast(`${partName(m)} — 보드에서 달 자리를 누르세요${m.kind === 'ls' || m.kind === 'sen' ? ' (실린더 끝의 점선 칸)' : ''}. 다시 누르거나 Esc면 취소.`, 6000);
+  drawPlacing(); markTray();
+}
+function markTray() { const pl = app.wire.placing; document.querySelectorAll('.wpart').forEach(b => b.classList.toggle('on', !!pl && b.dataset.pid === pl.pid)); }
+function dragChip(e, txt) {
+  let c = $('#wChip');
+  if (!e) { if (c) c.hidden = true; return; }
+  if (!c) { c = h('div', 'wchip'); c.id = 'wChip'; document.body.appendChild(c); }
+  const r = WP.svg && WP.svg.getBoundingClientRect(), over = r && e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+  c.hidden = !!over; c.textContent = txt;
+  c.style.left = (e.clientX + 12) + 'px'; c.style.top = (e.clientY + 10) + 'px';
+}
+function svgPt(e) { const p = WP.svg.createSVGPoint(); p.x = e.clientX; p.y = e.clientY; return p.matrixTransform(WP.svg.getScreenCTM().inverse()); }
+/* 놓을 자리 후보 (격자 4에 맞추고, 리밋스위치는 가까운 끝 자리에 붙음) */
+function placingMove(e) {
+  const w = app.wire, pl = w.placing; if (!pl || !WP.svg || !w.panel.air) return;
+  const r = WP.svg.getBoundingClientRect();
+  if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) { pl.cand = null; drawPlacing(); return; }
+  const p = svgPt(e), B = w.panel.air.board;
+  const bx = Math.round((p.x - B.x - pl.grab[0]) / 4) * 4, by = Math.round((p.y - B.y - pl.grab[1]) / 4) * 4;
+  pl.cand = WIRE.placeCheck(w.full, curPlace(pl.pid), pl.pid, bx, by);
+  drawPlacing();
+}
+function placingDrop(e) {
+  const w = app.wire, pl = w.placing; if (!pl) return;
+  placingMove(e);
+  const c = pl.cand;
+  if (c && c.ok) { commitPlace(pl.pid, c.x, c.y, pl.from); return; }
+  if (pl.from === 'board' && !c) {
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    if (el && el.closest && el.closest('#errCard')) { const pid = pl.pid; endPlacing(); uninstallPart(pid); return; }
+  }
+  if (c && !c.ok) wireToast(c.reason, 4500);
+  endPlacing();
+}
+function endPlacing() {
+  const w = app.wire; w.placing = null;
+  if (WP.svg) WP.svg.querySelectorAll('.amod.moving').forEach(g => g.classList.remove('moving'));
+  drawPlacing(); markTray();
+}
+function commitPlace(pid, x, y, from) {
+  const w = app.wire, m = fullMod(pid); if (!m) return;
+  const before = (w.wiresAside || []).length + (w.tubesAside || []).length;
+  pushUndo();
+  w.place[pid] = [x, y]; w.placing = null;
+  placeChanged();
+  const back = before - w.wiresAside.length - w.tubesAside.length;
+  const sl = m.kind === 'ls' || m.kind === 'sen' ? w.full.air.lsSlots.find(q => q.ax === x && q.ay === y) : null;
+  const left = instMods().filter(q => !w.place[q.pid]).length;
+  wireToast(`${partName(m)} ${from === 'board' ? '옮겼어요' : '달았어요'}` + (sl ? ` — 실린더 ${sl.act} ${sl.end ? '전진 끝' : '후진 끝'}을 감지해요` : '')
+    + (back > 0 ? ` · 꽂아 두었던 선·${FW().tube} ${back}개가 다시 이어졌어요` : '')
+    + (from !== 'board' ? (left ? ` · 남은 부품 ${left}개` : ' · 부품을 모두 달았어요 ✓') : ''), 4200);
+}
+function uninstallPart(pid) {
+  const w = app.wire, m = fullMod(pid); if (!m || !w.place[pid]) return;
+  const before = (w.wiresAside || []).length + (w.tubesAside || []).length;
+  pushUndo();
+  delete w.place[pid]; w.selMod = null; w.placing = null;
+  placeChanged();
+  const n = w.wiresAside.length + w.tubesAside.length - before;
+  wireToast(`${partName(m)} 뺐어요 — 부품함으로 돌아갔어요` + (n > 0 ? ` · 꽂혀 있던 선·${FW().tube} ${n}개는 따로 두었다가 다시 달면 그대로 이어져요` : ''), 4500);
+}
+function installRest() {
+  const w = app.wire, home = WIRE.homePlace(w.full), cur = curPlace(), blocked = [];
+  pushUndo();
+  let n = 0;
+  for (const m of instMods()) {
+    if (cur[m.pid]) continue;
+    const r = WIRE.placeCheck(w.full, cur, m.pid, home[m.pid][0], home[m.pid][1]);
+    if (r.ok) { cur[m.pid] = [r.x, r.y]; w.place[m.pid] = [r.x, r.y]; n++; } else blocked.push(partName(m));
+  }
+  w.placing = null;
+  placeChanged();
+  wireToast((n ? `부품 ${n}개를 모범 자리에 달았어요.` : '모범 자리가 모두 막혀 있어요.') + (blocked.length ? ` 자리가 막힌 ${blocked.length}개(${blocked.slice(0, 3).join(', ')}${blocked.length > 3 ? ' …' : ''})는 직접 달아 주세요.` : ''), 5000);
+}
+function uninstallAll() {
+  const w = app.wire; pushUndo();
+  for (const m of instMods()) delete w.place[m.pid];
+  w.placing = null; w.selMod = null;
+  placeChanged();
+  wireToast('단 부품을 모두 뺐어요 — 꽂혀 있던 선 · 관은 따로 두었다가 다시 달면 그대로 이어져요.', 4000);
+}
+/* 끌고 있는 부품 그림자 · 리밋스위치 자리 */
+function drawPlacing() {
+  const g = WP.gPl; if (!g) return; clear(g);
+  const w = app.wire, pl = w.placing, pn = w.panel; if (!pl || !pn.air) return;
+  const m = fullMod(pl.pid); if (!m) return;
+  const B = pn.air.board;
+  if (m.kind === 'ls' || m.kind === 'sen') {
+    const cur = curPlace(pl.pid);
+    for (const sl of w.full.air.lsSlots) {
+      const occ = Object.values(cur).some(p => p[0] === sl.ax && p[1] === sl.ay);
+      S('rect', { class: 'pslot' + (occ ? ' occ' : ''), x: B.x + sl.ax, y: B.y + sl.ay, width: 88, height: 70, rx: 5 }, g);
+      if (!occ) T(g, B.x + sl.ax + 44, B.y + sl.ay + 40, `${sl.act} ${sl.end ? '전진 끝' : '후진 끝'}`, 'pslt', 'middle');
+    }
+  }
+  const c = pl.cand; if (!c) return;
+  const x = B.x + c.x, y = B.y + c.y;
+  S('rect', { class: 'pghost ' + (c.ok ? 'ok' : 'no'), x, y, width: m.w, height: m.h, rx: 4 }, g);
+  for (const p of m.ports) S('circle', { class: 'pgport', cx: x + p.lx, cy: y + p.ly, r: 6 }, g);
+  for (const j of m.jacks) S('circle', { class: 'pgjack', cx: x + j.lx, cy: y + j.ly, r: 4 }, g);
+  T(g, x + m.w / 2, y + Math.min(m.h / 2 + 4, 40), partName(m), 'pgtxt', 'middle');
+  if (!c.ok && c.reason) {
+    const ty = y > B.y + 30 ? y - 9 : y + m.h + 16;
+    T(g, Math.min(Math.max(x + m.w / 2, B.x + 170), B.x + B.w - 170), ty, c.reason, 'pgwhy', 'middle');
+  }
 }
 function wireBadge() {
   const b = $('#wireBadge'); if (!b) return;
@@ -1822,7 +2080,8 @@ function drawOilModule(g, m) {
 }
 function drawAirModule(g0, m) {
   const P = WP.parts;
-  const g = S('g', { class: 'amod k-' + m.kind + (m.oil || OIL_KINDS.has(m.kind) ? ' oil' : ''), transform: `translate(${m.x},${m.y})` }, g0);
+  const g = S('g', { class: 'amod k-' + m.kind + (m.oil || OIL_KINDS.has(m.kind) ? ' oil' : '') + (m.inst ? ' inst' : ''), transform: `translate(${m.x},${m.y})` }, g0);
+  if (m.inst) { g.setAttribute('data-mod', m.id); S('title', null, g).textContent = partName(m) + ' — 끌면 옮겨요 · 누르면 골라서 "부품 빼기"'; }
   if (m.oil || OIL_KINDS.has(m.kind)) { drawOilModule(g, m); for (const p of m.ports || []) drawCoupler(g, p); for (const j of m.jacks) drawJack(g, j); return; }
   if (m.kind === 'cyl') {
     T(g, 0, -6, m.title, 'atitle');
@@ -2051,12 +2310,13 @@ function renderPanel() {
     const B = pn.air.board;
     S('rect', { class: 'aboard', x: B.x, y: B.y, width: B.w, height: B.h, rx: 6 }, svg);
     for (let y = B.y + 12; y < B.y + B.h - 8; y += 24) { S('rect', { class: 'aslot', x: B.x + 6, y, width: B.w - 12, height: 5, rx: 2.5 }, svg); S('rect', { class: 'aslot2', x: B.x + 6, y: y + 5, width: B.w - 12, height: 1.2 }, svg); }
-    T(svg, 14, pn.fieldY + 2, pn.air.medium === 'oil' ? '유압 보드 — 호스(퀵 커플러)는 커플러끼리 · 전기는 리밋스위치 · 솔레노이드 코일 단자에 (도면 이름으로 표시)' : '공압 보드 — 관(공기)은 흰 포트끼리 · 전기는 리밋스위치 · 센서 · 솔레노이드 코일 단자에 (도면 이름으로 표시)', 'wsec');
+    T(svg, 14, pn.fieldY + 2, pn.air.medium === 'oil' ? '유압 보드 — 부품을 달고(오른쪽 부품함) 호스(퀵 커플러)는 커플러끼리 · 전기는 리밋스위치 · 솔레노이드 코일 단자에' : '공압 보드 — 부품을 달고(오른쪽 부품함) 관(공기)은 흰 포트끼리 · 전기는 리밋스위치 · 센서 · 솔레노이드 코일 단자에', 'wsec');
+    if (!pn.field.some(m => m.inst)) T(svg, B.x + B.w / 2, B.y + B.h - 26, '아직 단 부품이 없어요 — 오른쪽 "부품 설치"의 부품함에서 끌어다 놓으세요', 'wempty', 'middle');
   } else T(svg, 14, pn.fieldY + 2, '보드 기기 — 실린더 리밋스위치 · 근접센서 · 솔레노이드 밸브 (도면 이름으로 표시)', 'wsec');
   const gM = S('g', null, svg);
   WP.gT = S('g', { class: 'wtubes' }, svg); WP.gTE = S('g', { class: 'wtends' }, svg); WP.gGT = S('g', { class: 'wghost' }, svg);
   WP.gW = S('g', { class: 'wwires' }, svg); WP.gG = S('g', { class: 'wghost' }, svg); WP.gP = S('g', { class: 'wplugs' }, svg);
-  const gH = S('g', { class: 'whits' }, svg); WP.gFX = S('g', { class: 'wfx' }, svg); WP.gO = S('g', { class: 'wover' }, svg);
+  const gH = S('g', { class: 'whits' }, svg); WP.gFX = S('g', { class: 'wfx' }, svg); WP.gO = S('g', { class: 'wover' }, svg); WP.gPl = S('g', { class: 'wplace' }, svg);
   for (const m of pn.modules) drawModule(gM, m);
   for (const id of pn.jackIds) {
     const j = pn.jacks[id];
@@ -2070,17 +2330,18 @@ function renderPanel() {
     S('title', null, c).textContent = WIRE.portName(pn, id);
   }
   bindPanel(svg);
-  renderWires(); renderTubes(); drawOverlay(); wireBadge();
+  renderWires(); renderTubes(); drawOverlay(); wireBadge(); drawPlacing();
 }
 /* 관 모양: 포트가 향한 쪽으로 나갔다가 휘어 들어감 */
 const FN = { n: [0, -1], s: [0, 1], e: [1, 0], w: [-1, 0] };
 function tubePath(a, b, pt) {
   const A = app.wire.panel.air.ports, pa = A[a], pb = pt || A[b];
+  if (!pa || !pb) return null;
   const d = Math.hypot(pb.x - pa.x, pb.y - pa.y), k = Math.max(16, Math.min(64, d * 0.42));
   const na = FN[pa.face], nb = pb.face ? FN[pb.face] : [0, 0];
   return `M${pa.x},${pa.y} C${(pa.x + na[0] * k).toFixed(1)},${(pa.y + na[1] * k).toFixed(1)} ${(pb.x + nb[0] * k).toFixed(1)},${(pb.y + nb[1] * k).toFixed(1)} ${pb.x},${pb.y}`;
 }
-function ensureAutoAir() { const w = app.wire; if (!w.autoAir) w.autoAir = WIRE.autoPipe(w.panel); return w.autoAir; }
+function ensureAutoAir() { const w = app.wire; if (!w.autoAir) w.autoAir = WIRE.autoPipe(PNF()); return w.autoAir; }
 function renderTubes() {
   const w = app.wire, pn = w.panel; if (!WP.gT) return;
   clear(WP.gT); clear(WP.gTE); clear(WP.gGT); WP.tubes = [];
@@ -2093,7 +2354,7 @@ function renderTubes() {
     WP.tubes.push({ g, i, last: null });
     for (const id of [t.a, t.b]) { const p = pn.air.ports[id]; S('circle', { class: 'atend' + (oil ? ' oil' : ''), cx: p.x, cy: p.y, r: oil ? 5.4 : 4.2 }, WP.gTE); }
   });
-  if (w.ghost) for (const t of ensureAutoAir().tubes) S('path', { class: 'gt', d: tubePath(t.a, t.b) }, WP.gGT);
+  if (w.ghost) for (const t of ensureAutoAir().tubes) { const d = tubePath(t.a, t.b); if (d) S('path', { class: 'gt', d }, WP.gGT); }
 }
 function flashPorts(ids) { app.wire.flash = { jacks: new Set(), wires: new Set(), ports: new Set(ids), tubes: new Set() }; drawOverlay(); clearTimeout(WP.ft); WP.ft = setTimeout(() => { app.wire.flash = null; drawOverlay(); }, 1600); }
 /* 매 프레임: 실린더 로드 · 밸브 스풀 · 압력계 · 관 압력 색 · 새는 곳 */
@@ -2152,6 +2413,7 @@ function renderFx(fx) {
 }
 function wirePath(a, b) {
   const pn = app.wire.panel, A = pn.jacks[a], B = pn.jacks[b];
+  if (!A || !B) return null;
   const dx = B.x - A.x, dy = B.y - A.y, d = Math.hypot(dx, dy);
   const s = Math.min(46, 8 + d * 0.13);
   return `M${A.x},${A.y} C${A.x + dx * 0.25},${A.y + dy * 0.25 + s} ${B.x - dx * 0.25},${B.y - dy * 0.25 + s} ${B.x},${B.y}`;
@@ -2171,8 +2433,9 @@ function renderWires() {
     for (const id of [x.a, x.b]) { const J = pn.jacks[id]; S('circle', { class: 'plug c-' + col, cx: J.x, cy: J.y, r: 5.6 }, WP.gP); S('circle', { class: 'plugin', cx: J.x, cy: J.y, r: 2 }, WP.gP); }
   });
   if (w.ghost) {
-    if (!w.auto) { w.auto = WIRE.autoWire(pn, app.def); w.auto.def = app.def; }
-    for (const x of w.auto.wires) S('path', { class: 'gw c-' + wireColor(x), d: wirePath(x.a, x.b) }, WP.gG);
+    for (const x of ensureAuto().wires) { const d = wirePath(x.a, x.b); if (d) S('path', { class: 'gw c-' + wireColor(x), d }, WP.gG); }
+    // 안 단 부품의 모범 자리
+    if (pn.air) { const B = pn.air.board, cur = curPlace(); for (const m of instMods()) if (!cur[m.pid]) { S('rect', { class: 'ghome', x: B.x + m.home[0], y: B.y + m.home[1], width: m.w, height: m.h, rx: 4 }, WP.gG); T(WP.gG, B.x + m.home[0] + m.w / 2, B.y + m.home[1] + Math.min(m.h / 2 + 4, 38), m.w < 60 ? (m.kind === 'sc' ? '속도' + m.plabel.slice(-1) : PART_BADGE[m.kind] || m.id) : partName(m), 'ghomet', 'middle'); } }
   }
 }
 function drawOverlay() {
@@ -2186,9 +2449,11 @@ function drawOverlay() {
   const pring = (id, cls) => { const p = A && A.ports[id]; if (p) S('circle', { class: 'oring ' + cls, cx: p.x, cy: p.y, r: 10 }, g); };
   if (A && w.hoverP && w.AM) { const n = w.AM.node(w.hoverP); for (const id of A.portIds) if (w.AM.node(id) === n) pring(id, id === w.hoverP ? 'hv0' : 'hv'); }
   if (w.selP) pring(w.selP, 'sel');
+  if (w.selMod && pn.mods[w.selMod]) { const m = pn.mods[w.selMod]; S('rect', { class: 'msel', x: m.x - 5, y: m.y - 5, width: m.w + 10, height: m.h + 10, rx: 6 }, g); }
   if (w.flash) {
-    for (const x of w.flash.ghost || []) S('path', { class: 'ogw', d: wirePath(x.a, x.b) }, g);
-    if (A) for (const x of w.flash.ghostT || []) S('path', { class: 'ogt', d: tubePath(x.a, x.b) }, g);
+    for (const x of w.flash.ghost || []) { const d = wirePath(x.a, x.b); if (d) S('path', { class: 'ogw', d }, g); }
+    if (A) for (const x of w.flash.ghostT || []) { const d = tubePath(x.a, x.b); if (d) S('path', { class: 'ogt', d }, g); }
+    for (const id of w.flash.mods || []) { const m = pn.mods[id]; if (m) S('rect', { class: 'mfl', x: m.x - 6, y: m.y - 6, width: m.w + 12, height: m.h + 12, rx: 7 }, g); }
     for (const id of w.flash.jacks) ring(id, 'fl');
     for (const id of w.flash.ports || []) pring(id, 'fl');
     for (const i of w.flash.wires) { const x = w.wires[i]; if (x) S('path', { class: 'oflw', d: wirePath(x.a, x.b) }, g); }
@@ -2199,9 +2464,13 @@ function drawOverlay() {
 function flashSimple(jacks) { app.wire.flash = { jacks: new Set(jacks), wires: new Set() }; drawOverlay(); clearTimeout(WP.ft); WP.ft = setTimeout(() => { app.wire.flash = null; drawOverlay(); }, 1600); }
 function flashItem(it) {
   const w = app.wire;
-  w.flash = { jacks: new Set(it.jacks || []), wires: new Set(it.wires || []), ghost: it.ghost || null, ports: new Set(it.ports || []), tubes: new Set(it.tubes || []), ghostT: it.ghostT || null };
+  w.flash = { jacks: new Set(it.jacks || []), wires: new Set(it.wires || []), ghost: it.ghost || null, ports: new Set(it.ports || []), tubes: new Set(it.tubes || []), ghostT: it.ghostT || null, mods: it.mods || [] };
   drawOverlay();
-  const pn = w.panel, J = pn.jacks[(it.jacks || [])[0]] || (pn.air && pn.air.ports[(it.ports || [])[0]]);
+  if (it.pid) {   // 안 단 부품: 부품함 카드를 깜빡임
+    const card = document.querySelector(`.wpart[data-pid="${CSS.escape(it.pid)}"]`);
+    if (card) { card.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); card.classList.remove('pulse'); void card.offsetWidth; card.classList.add('pulse'); }
+  }
+  const pn = w.panel, M0 = pn.mods[(it.mods || [])[0]], J = pn.jacks[(it.jacks || [])[0]] || (pn.air && pn.air.ports[(it.ports || [])[0]]) || (M0 ? { x: M0.x + M0.w / 2, y: M0.y + M0.h / 2 } : null);
   const body = $('#wireBody');
   if (J && body && it.scroll !== false) {
     const sv = WP.svg.getBoundingClientRect(), sc = sv.width / pn.W;
@@ -2217,7 +2486,7 @@ function flashItem(it) {
   }
   clearTimeout(WP.ft); WP.ft = setTimeout(() => { w.flash = null; drawOverlay(); app.flashIds = null; app.guideIds = null; drawAllMarks(); }, it.ghost ? 6500 : 4200);
 }
-function ensureAuto() { const w = app.wire; if (!w.auto) { w.auto = WIRE.autoWire(w.panel, app.def); w.auto.def = app.def; } return w.auto; }
+function ensureAuto() { const w = app.wire; if (!w.auto) { w.auto = WIRE.autoWire(PNF(), app.def); w.auto.def = app.def; } return w.auto; }
 /* 참고 도면: 접점 옆에 모범 배선 단자 번호 */
 function annotateLadder() {
   const a = ensureAuto();
@@ -2233,7 +2502,7 @@ function refTitle(e) {
   return { coil: e.name + ' 코일', sol: e.name + ' 솔레노이드', sen: e.name + ' 근접센서', tmr: '타이머 ' + e.name + ' 코일', cnt: '카운터 입력(Count)', crst: '카운터 리셋(Reset)' }[e.type] || e.name;
 }
 function wireRefClick(it, ev) {
-  const w = app.wire, a = ensureAuto(), x = a.assign[it.e.id], pn = w.panel;
+  const w = app.wire, a = ensureAuto(), x = a.assign[it.e.id], pn = PNF();
   const jn = id => WIRE.jackName(pn, id);
   const pop = placePop(it, true);
   pop.appendChild(h('h3', null, refTitle(it.e)));
@@ -2350,6 +2619,14 @@ function bindPanel(svg) {
   const portAt = ev => { const el = document.elementFromPoint(ev.clientX, ev.clientY); const j = el && el.closest ? el.closest('[data-port]') : null; return j ? j.getAttribute('data-port') : null; };
   svg.onpointerdown = ev => {
     const t = ev.target;
+    // 부품함에서 고른 부품: 보드를 누르면 그 자리에 달기
+    if (w.placing && w.placing.armed) {
+      ev.preventDefault(); placingMove(ev);
+      const c = w.placing.cand;
+      if (c && c.ok) commitPlace(w.placing.pid, c.x, c.y, w.placing.from);
+      else wireToast(c ? c.reason : '보드 안을 눌러 주세요.', 4000);
+      return;
+    }
     const jid = t.getAttribute && t.getAttribute('data-jack');
     if (jid) { ev.preventDefault(); drag = { from: jid, x: ev.clientX, y: ev.clientY, moved: false, id: ev.pointerId }; try { svg.setPointerCapture(ev.pointerId); } catch (e) { } return; }
     const pid = t.getAttribute && t.getAttribute('data-port');
@@ -2358,6 +2635,13 @@ function bindPanel(svg) {
     if (wg) { const wi = +wg.getAttribute('data-wire'); selectWire(w.selWire === wi ? -1 : wi); return; }
     const tg = t.closest && t.closest('[data-tube]');
     if (tg) { const ti = +tg.getAttribute('data-tube'); selectTube(w.selTube === ti ? -1 : ti); return; }
+    const mg = t.closest && t.closest('[data-mod]');
+    if (mg && !(t.closest && t.closest('[data-btn]'))) {
+      ev.preventDefault();
+      drag = { mod: mg.getAttribute('data-mod'), x: ev.clientX, y: ev.clientY, moved: false, id: ev.pointerId, p0: pt(ev) };
+      try { svg.setPointerCapture(ev.pointerId); } catch (e) { }
+      return;
+    }
     const btn = t.closest && t.closest('[data-btn]');
     if (btn) {
       ev.preventDefault();
@@ -2381,8 +2665,23 @@ function bindPanel(svg) {
     if (w.sel || w.selP) { w.sel = null; w.selP = null; drawOverlay(); }
     if (w.selWire >= 0) selectWire(-1);
     if (w.selTube >= 0) selectTube(-1);
+    if (w.selMod) { w.selMod = null; updDel(); drawOverlay(); }
   };
   svg.onpointermove = ev => {
+    if (w.placing && w.placing.armed && !drag) { placingMove(ev); return; }
+    if (drag && drag.mod && drag.id === ev.pointerId) {
+      if (!drag.moved && Math.hypot(ev.clientX - drag.x, ev.clientY - drag.y) > 6) {
+        drag.moved = true;
+        const m = w.panel.mods[drag.mod], p = drag.p0;
+        if (m && m.pid) {
+          w.placing = { pid: m.pid, from: 'board', grab: [p.x - m.x, p.y - m.y], armed: false, cand: null };
+          w.selMod = null; updDel(); drawOverlay();
+          const g = svg.querySelector(`.amod[data-mod="${CSS.escape(drag.mod)}"]`); if (g) g.classList.add('moving');
+        }
+      }
+      if (drag.moved && w.placing) placingMove(ev);
+      return;
+    }
     if (drag && drag.id === ev.pointerId) {
       if (!drag.moved && Math.hypot(ev.clientX - drag.x, ev.clientY - drag.y) > 6) drag.moved = true;
       if (drag.moved) {
@@ -2401,6 +2700,25 @@ function bindPanel(svg) {
     if (WP.repId === ev.pointerId) { clearTimeout(WP.repT); clearInterval(WP.rep); WP.repId = null; }
     for (const k in panelHeld) if (panelHeld[k] === ev.pointerId) { delete panelHeld[k]; pressPanel(k, false); }
     if (!drag || drag.id !== ev.pointerId) return;
+    if (drag.mod) {
+      const d = drag; drag = null;
+      if (ev.type === 'pointercancel') { if (w.placing && !w.placing.armed) endPlacing(); return; }   // 터치 스크롤 등
+      if (d.moved && w.placing) { placingDrop(ev); return; }
+      const m = w.panel.mods[d.mod];
+      if (w.selMod === d.mod && m && m.pid) {
+        // 고른 부품을 한 번 더 누르면: 옮길 자리를 누르는 모드 (터치에서 옮기기)
+        w.placing = { pid: m.pid, from: 'board', grab: [m.w / 2, m.h / 2], armed: true, cand: null };
+        w.selMod = null; updDel(); drawOverlay(); drawPlacing();
+        const g = svg.querySelector(`.amod[data-mod="${CSS.escape(d.mod)}"]`); if (g) g.classList.add('moving');
+        wireToast(`${partName(m)} — 옮길 자리를 누르세요 (Esc: 취소)`, 5000);
+        return;
+      }
+      w.selMod = d.mod; w.sel = null; w.selP = null;
+      if (w.selWire >= 0 || w.selTube >= 0) { w.selWire = -1; w.selTube = -1; renderWires(); renderTubes(); }
+      updDel(); drawOverlay();
+      if (m) wireToast(`${partName(m)} 골랐어요 — 끌거나 한 번 더 누른 뒤 새 자리를 누르면 옮겨요 · "부품 빼기"(Delete)면 부품함으로 돌아가요.`, 4200);
+      return;
+    }
     const isPort = !!drag.port, from = drag.from, moved = drag.moved;
     const toJ = jackAt(ev), toP = portAt(ev);
     drag = null; WP.rubber = null;
@@ -2593,7 +2911,7 @@ function valveChanges(toApp) {
 }
 /* 유압 응용: 보드에 붙는 부품 이름 (지금 보드 기준) */
 function appParts() {
-  const A = app.wire.panel && app.wire.panel.air; if (!A || A.medium !== 'oil') return [];
+  const A = PNF() && PNF().air; if (!A || A.medium !== 'oil') return [];
   const aw = X => (A.cyls.some(c => c.act === X) ? '실린더 ' : '모터 ') + X;
   const out = A.comps.filter(c => !(c.kind === 'hck' && c.down && !c.pump)).map(c => (c.act ? aw(c.act) + ' ' : '') + c.title);
   for (const m of A.mcs) out.push(aw(m.act) + ' 멀티 커넥터');
@@ -2606,11 +2924,12 @@ function setStage(k) {
   w.target = k; store.set('stage.' + P.key, k);
   rebuild();
   const f = FW(), air = f.air, ch = air ? valveChanges(k === 'app') : [], added = k === 'app' ? appParts() : [];
+  const left = instMods().filter(m => !w.place[m.pid]).length;
   wireToast((k === 'app' ? `② 응용 동작으로 넘어왔어요. 꽂은 ${air ? (f.oil ? '선·호스는' : '선·관은') : '선은'} 그대로예요.` : '① 기본 동작으로 돌아왔어요.')
-    + (ch.length ? ' 보드 밸브도 바꿨어요: ' + ch.join(' · ') + '.' : '')
-    + (added.length ? ` 보드에 응용 부품을 붙였어요: ${added.join(' · ')} — 호스를 빼서 그 사이에 넣어 꽂으세요.` : '')
-    + (gone.length ? ` 응용 부품(${gone.join(' · ')})은 보드에서 뺐어요` + (w.tubesAside && w.tubesAside.length ? ` — 거기 꽂았던 호스 ${w.tubesAside.length}개는 ②로 가면 다시 보여요.` : '.') : '')
-    + (app.wire.dropped ? ` 없어진 ${app.wire.droppedOn.join('·')} 코일에 꽂혀 있던 선 ${app.wire.dropped}개는 뺐어요 — 그 선으로 이어지던 0V · 접점 연결은 다시 확인하세요.` : ''), added.length || gone.length ? 11000 : 8000);
+    + (ch.length ? ` 밸브를 바꿔 달아야 해요: ${ch.join(' · ')} — 쓰던 밸브는 뺐고 새 밸브가 부품함에 있어요.` : '')
+    + (added.length ? ` 부품함에 응용 부품이 들어왔어요: ${added.join(' · ')} — 보드에 달고 호스를 사이에 넣어 꽂으세요.` : '')
+    + (gone.length ? ` 응용 부품(${gone.join(' · ')})은 ①에서는 보드에서 빠져요` + (w.tubesAside && w.tubesAside.length ? ` — 거기 꽂았던 호스는 ②로 가면 다시 보여요.` : '.') : '')
+    + (left && !ch.length && !added.length ? ` 아직 안 단 부품이 ${left}개 있어요.` : ''), added.length || gone.length || ch.length ? 11000 : 7000);
 }
 function wirePanel(body, title) {
   const P = app.P, w = app.wire, pn = w.panel, air = !!pn.air, isApp = w.target === 'app' && !!P.app, f = FW();
@@ -2618,9 +2937,10 @@ function wirePanel(body, title) {
   if (P.app) body.appendChild(stageBar());
   body.appendChild(h('p', 'note', isApp
     ? `①에서 꽂은 배선${air ? '·배관' : ''}에서 이어서 응용 조건대로 고쳐요. 바뀐 곳은 전기 회로도에 보라색으로 표시돼요. 다 고치면 "응용 동작 검사"를 누르세요.`
-    : (air ? (f.oil ? '위는 실습장 트레이너와 같은 전기 단자, 아래는 유압 보드예요(오른쪽 위가 파워 유닛, 그 아래가 P · T 분배기). 전원과 버스 점퍼는 꽂힌 상태로 시작해요. 정정 도면대로 선을, 유압 회로도대로 호스를 꽂고 "기본 동작 검사"를 누르세요.' : '위는 실습장 트레이너와 같은 전기 단자, 아래는 공압 보드예요. 전원과 버스 점퍼는 꽂힌 상태로 시작해요. 정정 도면대로 선을, 공압 회로도대로 관을 꽂고 "기본 동작 검사"를 누르세요.')
+    : (air ? (f.oil ? '위는 실습장 트레이너와 같은 전기 단자, 아래는 유압 보드예요(오른쪽 위가 파워 유닛). 전원과 버스 점퍼는 꽂힌 상태로 시작해요. 먼저 부품함의 부품을 보드에 달고, 정정 도면대로 선을, 유압 회로도대로 호스를 꽂은 뒤 "기본 동작 검사"를 누르세요.' : '위는 실습장 트레이너와 같은 전기 단자, 아래는 공압 보드예요. 전원과 버스 점퍼는 꽂힌 상태로 시작해요. 먼저 부품함의 부품을 보드에 달고, 정정 도면대로 선을, 공압 회로도대로 관을 꽂은 뒤 "기본 동작 검사"를 누르세요.')
       : '실습장 트레이너와 같은 단자예요. 전원과 버스 점퍼는 꽂힌 상태로 시작해요. 정정 도면대로 꽂고 "기본 동작 검사"를 누르세요.')
       + (P.app ? ' 통과하면 같은 배선에서 ② 응용 동작으로 이어가요.' : '')));
+  if (air) { const ib = h('div', 'winst'); ib.id = 'wInst'; body.appendChild(ib); }
   if (isApp) {
     const box = h('div', 'applist');
     box.appendChild(h('b', null, '응용 조건'));
@@ -2629,9 +2949,9 @@ function wirePanel(body, title) {
     for (const t of common.concat(P.apply || [])) ul.appendChild(h('li', null, t));
     box.appendChild(ul);
     const ch = air ? valveChanges(true) : [];
-    if (ch.length) box.appendChild(h('p', 'note sm', '보드의 밸브는 바꿔 놓았어요 — ' + ch.join(' · ') + (f.oil ? '. 호스는 그대로 꽂혀 있어요.' : '. 관은 그대로 꽂혀 있어요.')));
+    if (ch.length) box.appendChild(h('p', 'note sm', '밸브를 바꿔 달아야 해요 — ' + ch.join(' · ') + `. 쓰던 밸브는 보드에서 뺐고, 새 밸브가 부품함에 있어요. 같은 자리에 달면 꽂아 두었던 ${f.tube}${f.oil ? '는' : '은'} 그대로 이어져요.`));
     const parts = appParts();
-    if (parts.length) box.appendChild(h('p', 'note sm', '보드에 응용 부품을 붙여 놓았어요 — ' + parts.join(' · ') + '. 호스는 ①에서 꽂은 그대로라, 응용 회로도처럼 호스를 빼서 부품을 사이에 넣어 꽂아요.'));
+    if (parts.length) box.appendChild(h('p', 'note sm', '부품함에 응용 부품이 들어왔어요 — ' + parts.join(' · ') + '. 보드에 달고, 응용 회로도처럼 호스를 빼서 부품을 사이에 넣어 꽂아요.'));
     if (P.kind !== 'pneu') box.appendChild(h('p', 'note sm', '유압 응용은 유압 회로(밸브 추가 · 속도)만 바뀌고 전기 회로는 기본 동작과 같아요.'));
     body.appendChild(box);
   }
@@ -2641,7 +2961,7 @@ function wirePanel(body, title) {
     for (const v of pn.air.valves) { const r = h('span'); r.appendChild(h('b', null, v.coils.join('·'))); r.appendChild(document.createTextNode(' 밸브 → ' + E.actName(app.PV, v.act))); mt.appendChild(r); }
     for (const sp of pn.air.sups || []) { const r = h('span'); r.appendChild(h('b', null, sp.coil)); r.appendChild(document.createTextNode(' 공급 밸브 → ' + E.actName(app.PV, sp.act) + ' P 라인')); mt.appendChild(r); }
   }
-  mt.appendChild(h('span', 'wmapn', air ? (f.oil ? '리밋스위치 · 솔레노이드 코일은 유압 보드에 도면 이름(LS1, Y1 …)으로 붙어 있어요. 밸브는 유압 회로도처럼 자기 실린더 · 모터 아래에 있어요.' : '리밋스위치 · 센서 · 솔레노이드 코일은 공압 보드에 도면 이름(LS1, S1, Y1 …)으로 붙어 있어요. 밸브는 공압 회로도처럼 자기 실린더 아래에 있어요.') : '리밋스위치 · 센서 · 솔레노이드는 보드에 도면 이름(LS1, S1, Y1 …)으로 붙어 있어요.'));
+  mt.appendChild(h('span', 'wmapn', air ? (f.oil ? '리밋스위치 · 솔레노이드 코일에는 도면 이름(LS1, Y1 …)이 붙어 있어요. 밸브는 유압 회로도처럼 자기 실린더 · 모터 아래에 달면 호스가 짧아요.' : '리밋스위치 · 센서 · 솔레노이드 코일에는 도면 이름(LS1, S1, Y1 …)이 붙어 있어요. 밸브는 공압 회로도처럼 자기 실린더 아래에 달면 관이 짧아요.') : '리밋스위치 · 센서 · 솔레노이드는 보드에 도면 이름(LS1, S1, Y1 …)으로 붙어 있어요.'));
   body.appendChild(mt);
   const pre = h('p', 'note wpre'); pre.id = 'wPreNote'; body.appendChild(pre);
   const row = h('div', 'wrow');
@@ -2664,7 +2984,7 @@ function wirePanel(body, title) {
   gd.appendChild(h('p', 'note sm', '모범 배선 기준이에요. 줄 이름을 누르면 그 줄의 선이 배선판에 점선으로, 도면에는 보라색으로 표시돼요. 전기 회로도의 접점을 눌러도 꽂을 단자를 알려줘요.'));
   gd.addEventListener('toggle', () => {
     if (!gd.open || gd.dataset.done) return; gd.dataset.done = '1';
-    const a = ensureAuto(), G = WIRE.wireGuide(pn, app.def, a), jn = id => WIRE.jackName(pn, id);
+    const a = ensureAuto(), G = WIRE.wireGuide(PNF(), app.def, a), jn = id => WIRE.jackName(PNF(), id);
     for (const grp of G.groups) {
       const box = h('div', 'wg');
       const hd = h('button', 'wgh', (grp.no ? grp.no + '번 줄 · ' : '') + grp.title + ` (선 ${grp.wires.length})`);
@@ -2682,7 +3002,7 @@ function wirePanel(body, title) {
     gp.appendChild(h('p', 'note sm', f.oil ? '모범 배관 기준이에요. 묶음 이름을 누르면 그 호스들이 보드에 보라색 점선으로 보여요. P · T 분배기와 멀티 커넥터의 구멍 번호는 아무거나 써도 돼요. 유압 회로도의 실린더 · 모터 · 밸브를 눌러도 꽂을 커플러를 알려줘요.' : '모범 배관 기준이에요. 묶음 이름을 누르면 그 관들이 보드에 보라색 점선으로 보여요. 분배기 출구 번호는 아무거나 써도 돼요. 공압 회로도의 실린더 · 밸브를 눌러도 꽂을 포트를 알려줘요.'));
     gp.addEventListener('toggle', () => {
       if (!gp.open || gp.dataset.done) return; gp.dataset.done = '1';
-      const ap = ensureAutoAir(), pnm = id => WIRE.portName(pn, id);
+      const ap = ensureAutoAir(), pnm = id => WIRE.portName(PNF(), id);
       for (const grp of ap.groups) {
         const ts = grp.tubes.map(i => ap.tubes[i]);
         const box = h('div', 'wg');
@@ -2704,32 +3024,43 @@ function wirePanel(body, title) {
     const u2 = h('ul'); for (const t of (f.oil ? OIL_TIPS : AIR_TIPS)) u2.appendChild(h('li', null, t)); t2.appendChild(u2);
     body.appendChild(t2);
   }
-  renderWireResults(); wirePreNote();
+  renderWireResults(); wirePreNote(); fillInstall();
 }
 function applyAuto() {
-  const w = app.wire;
-  if (!w.auto) { w.auto = WIRE.autoWire(w.panel, app.def); w.auto.def = app.def; }
-  pushUndo(); w.wires = w.auto.wires.map(x => ({ a: x.a, b: x.b })); w.selWire = -1;
-  if (w.auto.presets) { Object.assign(w.panel.presets, w.auto.presets); store.set(preKey(), w.panel.presets); }
+  const w = app.wire, a = ensureAuto();
+  pushUndo(); w.wiresAll = a.wires.map(x => ({ a: x.a, b: x.b })); w.selWire = -1;
+  splitAside();
+  if (a.presets) { Object.assign(w.presets, a.presets); store.set(preKey(), w.presets); }
   wireChanged(); wirePreNote();
+  if (w.wiresAside.length) wireToast(`아직 안 단 부품으로 가는 선 ${w.wiresAside.length}개는 그 부품을 달면 꽂혀요.`, 4500);
 }
 function applyAutoAir() {
   const w = app.wire; if (!w.panel.air) return;
   const ap = ensureAutoAir();
-  pushUndo(); w.tubes = ap.tubes.map(t => ({ a: t.a, b: t.b })); w.tubesAside = []; w.selTube = -1; updDel();
+  pushUndo(); w.tubesAll = ap.tubes.map(t => ({ a: t.a, b: t.b })); w.selTube = -1; updDel();
+  splitAside();
   wireChanged();
+  if (w.tubesAside.length) wireToast(`아직 안 단 부품으로 가는 ${FW().tube} ${w.tubesAside.length}개는 그 부품을 달면 꽂혀요.`, 4500);
 }
 /* 단계 검사 (버튼 하나): 동작 검사(기본 PB1 2회 / 응용 조건) + 배선 · 배관을 도면과 비교 */
 function runStageCheck() {
   const w = app.wire, P = app.P, air = !!w.panel.air;
+  w.inst = air ? WIRE.installReport(w.full, curPlace(), app.PV) : null;
+  if (w.inst && w.inst.missing) {
+    // 부품이 다 달려야 돌려 볼 수 있음
+    w.check = null; w.checkAir = null; w.run = null; w.pass = false; w.stale = false;
+    renderWireResults(); refreshStageBar();
+    const first = w.inst.items.find(i => i.sev === 'err'); if (first) flashItem(first);
+    return;
+  }
   runWireCheck(true);
   runWireRun();
-  const ok = !!(w.run && w.run.ok && w.check && w.check.ok && (!air || (w.checkAir && w.checkAir.ok)));
+  const ok = !!(w.run && w.run.ok && w.check && w.check.ok && (!air || (w.checkAir && w.checkAir.ok)) && (!w.inst || w.inst.ok));
   w.pass = ok;
   if (ok) { const ps = stagePass(); ps[w.target] = true; store.set('passS.' + P.key, ps); }
   renderWireResults(); refreshStageBar();
   if (!ok) {
-    const first = w.check.items.find(i => i.sev === 'err' && (i.jacks.length || (i.wires || []).length)) || (w.checkAir && w.checkAir.items.find(i => i.sev === 'err' && ((i.ports || []).length || (i.tubes || []).length)));
+    const first = (w.inst && w.inst.items.find(i => i.sev === 'err')) || w.check.items.find(i => i.sev === 'err' && (i.jacks.length || (i.wires || []).length)) || (w.checkAir && w.checkAir.items.find(i => i.sev === 'err' && ((i.ports || []).length || (i.tubes || []).length)));
     if (first) flashItem(first);
   }
 }
@@ -2748,7 +3079,7 @@ function runWireCheck(quiet) {
 function runWireRun() {
   const w = app.wire, air = !!w.panel.air, f = FW();
   let r;
-  const def = () => ({ __net: WIRE.buildWireNet(w.panel, w.wires).net, __air: air ? WIRE.airModel(w.panel, w.tubes, { on: true, bvP: true, bvT: true }) : null });
+  const def = () => ({ __net: WIRE.buildWireNet(w.panel, w.wires).net, __air: air ? WIRE.airModel(w.panel, w.tubes, { on: true, bvP: true, bvT: true }) : null, __smap: w.panel.smap });
   try {
     if (w.target === 'app' && app.P.app) r = E.runAppCheck(app.PV, def(), { cpre: w.panel.refPre.C1, tpre: w.panel.refPre.T1 });
     else {
@@ -2782,14 +3113,19 @@ function wireItems(c, ul) {
     const li = h('li', 'wi ' + it.sev);
     li.appendChild(h('span', 'wic', { err: '✗', warn: '!', info: 'i' }[it.sev] || '·'));
     li.appendChild(h('span', 'wtx', it.text));
-    if ((it.jacks && it.jacks.length) || (it.wires && it.wires.length) || it.load || (it.ports && it.ports.length) || (it.tubes && it.tubes.length)) { li.classList.add('click'); li.onclick = () => flashItem(it); }
+    if ((it.jacks && it.jacks.length) || (it.wires && it.wires.length) || it.load || (it.ports && it.ports.length) || (it.tubes && it.tubes.length) || (it.mods && it.mods.length) || it.pid) { li.classList.add('click'); li.onclick = () => flashItem(it); }
     ul.appendChild(li);
   }
 }
 function renderWireResults() {
   const res = $('#wRes'); if (!res) return; clear(res);
   const w = app.wire, P = app.P, air = !!(w.panel && w.panel.air), f = FW();
-  if (w.stale) res.appendChild(h('p', 'note warnline', air ? (f.oil ? '선이나 호스가 바뀌었어요. 다시 검사해 보세요.' : '선이나 관이 바뀌었어요. 다시 검사해 보세요.') : '선이 바뀌었어요. 다시 검사해 보세요.'));
+  if (w.stale) res.appendChild(h('p', 'note warnline', air ? (f.oil ? '부품 · 선 · 호스가 바뀌었어요. 다시 검사해 보세요.' : '부품 · 선 · 관이 바뀌었어요. 다시 검사해 보세요.') : '선이 바뀌었어요. 다시 검사해 보세요.'));
+  if (w.inst && (w.inst.missing || w.inst.wrong)) {
+    res.appendChild(h('p', 'wsum badmsg', w.inst.missing ? `✗ 아직 보드에 달지 않은 부품이 ${w.inst.missing}개 있어요 — 부품을 모두 달면 동작 · 배선 · 배관을 검사해요. 항목을 누르면 부품함에서 깜빡여요.` : `✗ 리밋스위치 · 센서 자리가 도면과 달라요 (${w.inst.wrong}개) — 항목을 누르면 보드에서 깜빡여요.`));
+    res.appendChild(h('div', 'wsech', '부품 설치'));
+    const ul = h('ul', 'wlist'); wireItems(w.inst, ul); res.appendChild(ul);
+  } else if (w.inst && w.check) res.appendChild(h('div', 'wsech ok', '부품 설치 ✓'));
   if (w.run) { const box = h('div', 'chkres'); renderCheck(box, w.run); res.appendChild(box); }
   if (w.check) {
     const c = w.check, ca = air ? w.checkAir : null;
@@ -2818,6 +3154,16 @@ function wireHint() {
   diag.hidden = false;
   diag.appendChild(h('b', null, air ? '배선 · 배관 확인' : '배선 확인'));
   if (air) {
+    const ir = WIRE.installReport(w.full, curPlace(), app.PV);
+    if (!ir.ok) {
+      const errs = ir.items.filter(i => i.sev === 'err');
+      diag.appendChild(h('p', null, ir.missing ? `보드에 아직 안 단 부품이 ${ir.missing}개 있어요 — 오른쪽 "부품 설치"의 부품함에서 달아 주세요 (누르면 카드가 깜빡여요):` : '리밋스위치 · 센서 자리가 도면과 달라요 (누르면 보드에서 깜빡여요):'));
+      const ul = h('ul');
+      errs.slice(0, 4).forEach(it => { const li = h('li', 'click', it.text); li.onclick = () => flashItem(it); ul.appendChild(li); });
+      if (errs.length > 4) ul.appendChild(h('li', null, `… 그 밖에 ${errs.length - 4}개`));
+      diag.appendChild(ul);
+      return;
+    }
     if (f.oil) {
       if (!w.airOn) { diag.appendChild(h('p', null, '파워 유닛 펌프가 OFF예요. 보드 오른쪽 위 파워 유닛의 펌프 버튼을 눌러 켜세요.')); return; }
       if (!w.bvP || !w.bvT) { diag.appendChild(h('p', null, `파워 유닛의 ${!w.bvP ? 'P' : 'T'} 볼밸브가 닫혀 있어요. 손잡이를 눌러 라인과 나란하게(열림) 두세요.`)); return; }
@@ -2858,7 +3204,7 @@ function bindFluidRef() {
   });
 }
 function fluidRefPop(act, part, ev) {
-  const w = app.wire, pn = w.panel, A = pn.air, oil = A.medium === 'oil', ap = ensureAutoAir(), pnm = id => WIRE.portName(pn, id);
+  const w = app.wire, pn = PNF(), A = pn.air, oil = A.medium === 'oil', ap = ensureAutoAir(), pnm = id => WIRE.portName(pn, id);
   const grp = ap.groups.find(g => g.act === act), v = A.valves.find(x => x.act === act);
   if (!grp || !v) return;
   let idx = grp.tubes.slice();
@@ -2895,19 +3241,21 @@ function bindWireTools() {
   $('#wUndo').onclick = () => {
     if (!w.undo.length) return;
     const st = JSON.parse(w.undo.pop());
-    if (Array.isArray(st)) w.wires = st; else { w.wires = st.w || []; w.tubes = st.t || []; }
-    w.selWire = -1; w.selTube = -1; $('#wUndo').disabled = !w.undo.length; updDel(); wireChanged();
+    if (Array.isArray(st)) w.wiresAll = st; else { w.wiresAll = st.w || []; w.tubesAll = st.t || []; if (st.p) w.place = st.p; }
+    w.selWire = -1; w.selTube = -1; w.selMod = null; w.placing = null; $('#wUndo').disabled = !w.undo.length;
+    placeChanged(true);
   };
   $('#wDel').onclick = deleteSel;
   $('#wStart').onclick = () => {
     pushUndo();
-    w.wires = WIRE.startWires(w.panel); w.tubes = []; w.tubesAside = []; w.selWire = -1; w.selTube = -1; updDel();
-    w.panel.presets.T1 = 0; w.panel.presets.TOFF = 0; w.panel.presets.C1 = 10; store.set(preKey(), w.panel.presets);
+    w.wiresAll = WIRE.startWires(PNF()); w.tubesAll = []; w.selWire = -1; w.selTube = -1; w.selMod = null; w.placing = null;
+    if (w.panel.air) w.place = {};
+    w.presets.T1 = 0; w.presets.TOFF = 0; w.presets.C1 = 10; store.set(preKey(), w.presets);
     store.set('passS.' + app.P.key, {});
-    wireChanged(); wirePreNote(); refreshStageBar();
-    wireToast(`처음 상태로 — 전원 · 버스 점퍼만 꽂혀 있어요${w.panel.air ? ' (관은 모두 뺐어요)' : ''}. 타이머 0.0초 · 카운터 10으로 돌려 놓았어요.`);
+    placeChanged(true); wirePreNote(); refreshStageBar();
+    wireToast(`처음 상태로 — 전원 · 버스 점퍼만 꽂혀 있어요${w.panel.air ? `. 부품은 모두 부품함으로 돌아갔고 ${FW().tube}도 모두 뺐어요` : ''}. 타이머 0.0초 · 카운터 10으로 돌려 놓았어요.`, 5000);
   };
-  $('#wClear').onclick = () => { if (!w.wires.length && !w.tubes.length) return; pushUndo(); w.wires = []; w.tubes = []; w.selWire = -1; w.selTube = -1; updDel(); wireChanged(); };
+  $('#wClear').onclick = () => { if (!w.wires.length && !w.tubes.length && !(w.wiresAside || []).length && !(w.tubesAside || []).length) return; pushUndo(); w.wires = []; w.tubes = []; w.wiresAside = []; w.tubesAside = []; w.selWire = -1; w.selTube = -1; updDel(); wireChanged(); };
   $('#wLive').onchange = ev => { w.live = ev.target.checked; store.set('wireLive', w.live); WP.fxKey = null; };
   $('#wGhost').onchange = ev => { w.ghost = ev.target.checked; renderWires(); renderTubes(); };
   w.live = store.get('wireLive', true); $('#wLive').checked = w.live;
@@ -2915,8 +3263,8 @@ function bindWireTools() {
     if (app.view !== 'wire') return;
     const tag = (ev.target && ev.target.tagName) || '';
     if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
-    if ((ev.key === 'Delete' || ev.key === 'Backspace') && (w.selWire >= 0 || w.selTube >= 0)) { ev.preventDefault(); deleteSel(); }
-    else if (ev.key === 'Escape') { w.sel = null; w.selP = null; WP.rubber = null; if (w.selWire >= 0) selectWire(-1); else if (w.selTube >= 0) selectTube(-1); else drawOverlay(); }
+    if ((ev.key === 'Delete' || ev.key === 'Backspace') && (w.selWire >= 0 || w.selTube >= 0 || w.selMod)) { ev.preventDefault(); deleteSel(); }
+    else if (ev.key === 'Escape') { if (w.placing) { endPlacing(); return; } w.sel = null; w.selP = null; w.selMod = null; updDel(); WP.rubber = null; if (w.selWire >= 0) selectWire(-1); else if (w.selTube >= 0) selectTube(-1); else drawOverlay(); }
     else if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'z') { ev.preventDefault(); $('#wUndo').click(); }
   });
 }

@@ -182,7 +182,7 @@ class Sim {
     this.P = problem;
     this.net = def && def.__net ? def.__net : buildNet(def);
     this.airM = def && def.__air ? def.__air : null;   // 배선 연습 공압 보드: 관 연결대로 실린더를 움직임
-    this.smap = sensorMap(problem);
+    this.smap = def && def.__smap ? def.__smap : sensorMap(problem);   // 배선 연습: 보드에 직접 단 리밋스위치 · 센서 자리
     this.opt = opt;
     this.reset();
   }
